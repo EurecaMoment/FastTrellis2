@@ -10,7 +10,9 @@ FastTrellis2 基于 [Microsoft TRELLIS.2](https://github.com/microsoft/TRELLIS.2
 
 发布路线 `whole_bounded` 的六物体平均完整耗时为 **8.953 秒**，最慢 **10.693 秒**，**5/6** 低于 10 秒；历史 v7 UV 配置的同批平均值为 17.863 秒。旧配置只作为 A/B 对照，发布代码不提供运行入口。
 
-同一清理几何和解码 PBR 材质的八视角对照，六个物体的平均 PSNR 为 49.46–54.11 dB，48 个视角轮廓 IoU 均为 1，未新增岛内翻折；局部放大复核未见明显观感退化。纹素密度变化为 −1.12% 至 +1.49%，菠萝样本的像素中心 UV 重叠率轻微增加。启动和测试期间显存按 0.1 秒采样，峰值 26.634 GB，未触发 50 GB 保护。**这些是六个样本的结果，不保证任意新图都在 10 秒内，也不证明 UV 或外观逐像素完全相同；3 秒目标未达成。** 发布代码尚未替换 node1 正在运行的 v7 服务。
+同一清理几何和解码 PBR 材质的八视角对照，六个物体的平均 PSNR 为 49.46–54.11 dB，48 个视角轮廓 IoU 均为 1，未新增岛内翻折；局部放大复核未见明显观感退化。纹素密度变化为 −1.12% 至 +1.49%，菠萝样本的像素中心 UV 重叠率轻微增加。启动和测试期间显存按 0.1 秒采样，峰值 26.634 GB，未触发 50 GB 保护。**这些是六个样本的结果，不保证任意新图都在 10 秒内，也不证明 UV 或外观逐像素完全相同；3 秒目标未达成。**
+
+2026-11-12 已将 node1 GPU6 常驻服务切换到本仓库的快速 UV 路线。切换后的独立验收使用不同于预热图的 `reference.png` 新生成一份 4K PBR GLB：969,593 个三角面、166,651,972 字节，从读图到资产写完耗时 10.20 秒；服务随后返回 `ready`。这一个新样本不计入上述六样本平均值。
 
 ## 环境
 
@@ -38,7 +40,7 @@ python -m pip install ./third_party/CuMesh --no-build-isolation
 python fasttrellis2/build_extensions.py --cumesh-source third_party/CuMesh
 ```
 
-`setup.sh` 是上游安装脚本，负责基础库、nvdiffrast 与仓库自带的 O-Voxel。`fasttrellis2/build_extensions.py` 从本仓库的 C++/CUDA 源码构建一个有界分组 xatlas 模块、两个 Telea 模块、异步 BVH 和有界 CUDA scratch arena。产物位于 `fasttrellis2/build/`，不会提交到 Git。
+`setup.sh` 是上游安装脚本，负责基础库、nvdiffrast 与仓库自带的 O-Voxel。启动时必须能从当前 Python 环境导入已编译的 `o_voxel._C`。`fasttrellis2/build_extensions.py` 从本仓库的 C++/CUDA 源码构建一个有界分组 xatlas 模块、两个 Telea 模块、异步 BVH 和有界 CUDA scratch arena。产物位于 `fasttrellis2/build/`，不会提交到 Git。
 
 ## 准备模型
 

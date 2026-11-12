@@ -66,7 +66,6 @@ class TrellisModel:
         Path.home = classmethod(lambda _cls: cache_home)
         source_dir = Path(config.get('source_dir', self.root))
         sys.path.insert(0, str(source_dir))
-        sys.path.insert(0, str(source_dir / 'o-voxel'))
         import numpy as np
         import torch
         import torch.nn.functional as functional

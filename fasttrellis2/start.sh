@@ -15,7 +15,7 @@ for module in trellis_xatlas_bounded_whole trellis_telea_gpu trellis_telea_strea
 done
 
 mkdir -p "$repo/.cache/huggingface" "$repo/.cache/triton" "$repo/.cache/flex_gemm"
-export PYTHONPATH="$repo/fasttrellis2/runtime:$build:$repo:$repo/o-voxel${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH="$repo/fasttrellis2/runtime:$build:$repo${PYTHONPATH:+:$PYTHONPATH}"
 export LD_PRELOAD="$build/libtrellis_cuda_arena.so${FASTTRELLIS2_LIBSTDCXX_PRELOAD:+:$FASTTRELLIS2_LIBSTDCXX_PRELOAD}${LD_PRELOAD:+:$LD_PRELOAD}"
 if [[ -n "${CUDA_HOME:-}" && -d "$CUDA_HOME/lib64" ]]; then
     export LD_LIBRARY_PATH="$CUDA_HOME/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
