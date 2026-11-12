@@ -61,4 +61,3 @@ mkdir -p "$HF_HOME" "$HF_MODULES_CACHE" "$TORCH_EXTENSIONS_DIR" \
     "$CUDA_CACHE_PATH" "$TRITON_CACHE_DIR"
 
 exec bash "$task_repo/fasttrellis2/start.sh" --config "$task_config"
-

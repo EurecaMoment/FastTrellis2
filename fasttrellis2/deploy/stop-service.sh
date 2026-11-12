@@ -43,4 +43,3 @@ for task_attempt in {1..60}; do
 done
 echo "FastTrellis2 did not stop after SIGTERM; inspect pid $task_pid and $task_log_file." >&2
 exit 1
-

@@ -1,18 +1,18 @@
 # FastTrellis2
 
-FastTrellis2 基于 [Microsoft TRELLIS.2](https://github.com/microsoft/TRELLIS.2)，提供常驻的单图到 **512³ Mesh + 4K PBR GLB** 推理服务。完整采样仍是稀疏结构、形状、材质各 12 步。发布入口固定使用已验证的 4096 面连通预分块 xatlas UV 路线，并整合 node1 v7 的通用推理优化。原项目说明保存在 [README.upstream.md](README.upstream.md)。
+FastTrellis2 基于 [Microsoft TRELLIS.2](https://github.com/microsoft/TRELLIS.2)，提供常驻的单图到 **512³ Mesh + 4K PBR GLB** 推理服务。完整采样仍是稀疏结构、形状、材质各 12 步。发布入口固定使用已验证的 4096 面连通预分块 xatlas UV 路线，并整合已验证的 v7 通用推理优化。原项目说明保存在 [README.upstream.md](README.upstream.md)。
 
 本仓库不包含模型权重或已生成资产。**4096 是单个 UV 预分组的面数上限，不限制最终网格的总面数。**全部分组仍由 xatlas 展开并统一打包；预分组可能改变切缝与纹素分布。发布版没有旧 UV 路线的切换开关。
 
 ## 已验证的范围
 
-2026-11-12 在 node1 A800-SXM4-80GB GPU6 上，对六张此前未用于调优的图片分别用发布路线和历史 v7 配置完整生成资产。A/B 使用同一隔离常驻模型、512³、各 12 步、4K PBR、1024×1024 已整理输入和 alpha 掩码；每次重新生成资产，启动时只用其他图片预热。计时从读图至 GLB 写完。
+2026-11-12 在 NVIDIA A800-SXM4-80GB 上，对六张此前未用于调优的图片分别用发布路线和历史 v7 配置完整生成资产。A/B 使用同一隔离常驻模型、512³、各 12 步、4K PBR、1024×1024 已整理输入和 alpha 掩码；每次重新生成资产，启动时只用其他图片预热。计时从读图至 GLB 写完。
 
 发布路线 `whole_bounded` 的六物体平均完整耗时为 **8.953 秒**，最慢 **10.693 秒**，**5/6** 低于 10 秒；历史 v7 UV 配置的同批平均值为 17.863 秒。旧配置只作为 A/B 对照，发布代码不提供运行入口。
 
 同一清理几何和解码 PBR 材质的八视角对照，六个物体的平均 PSNR 为 49.46–54.11 dB，48 个视角轮廓 IoU 均为 1，未新增岛内翻折；局部放大复核未见明显观感退化。纹素密度变化为 −1.12% 至 +1.49%，菠萝样本的像素中心 UV 重叠率轻微增加。启动和测试期间显存按 0.1 秒采样，峰值 26.634 GB，未触发 50 GB 保护。**这些是六个样本的结果，不保证任意新图都在 10 秒内，也不证明 UV 或外观逐像素完全相同；3 秒目标未达成。**
 
-2026-11-12 已将 node1 GPU6 常驻服务切换到本仓库的快速 UV 路线。切换后的独立验收使用不同于预热图的 `reference.png` 新生成一份 4K PBR GLB：969,593 个三角面、166,651,972 字节，从读图到资产写完耗时 10.20 秒；服务随后返回 `ready`。这一个新样本不计入上述六样本平均值。
+2026-11-12 已将 A800 80GB GPU 上的常驻服务切换到本仓库的快速 UV 路线。切换后的独立验收使用不同于预热图的图片新生成一份 4K PBR GLB：969,593 个三角面、166,651,972 字节，从读图到资产写完耗时 10.20 秒；服务随后返回 `ready`。这一个新样本不计入上述六样本平均值。
 
 ## 环境
 
@@ -49,7 +49,7 @@ python fasttrellis2/build_extensions.py --cumesh-source third_party/CuMesh
 python fasttrellis2/prepare_models.py --output-dir models/trellis2
 ```
 
-脚本下载 `microsoft/TRELLIS.2-4B` 的 512 路线权重、外部稀疏解码器、公开的 timm DINOv3 与 `ZhengPeng7/BiRefNet`，在本机生成 `models/trellis2/pipeline.json`。node1 的验证基线使用这套公开条件模型配置；它与上游 `pipeline.json` 原配的 Facebook DINOv3、RMBG-2.0 配置不同。模型版本或条件模型改变后应重新做质量对照。模型下载需遵守各模型仓库的许可和访问要求。
+脚本下载 `microsoft/TRELLIS.2-4B` 的 512 路线权重、外部稀疏解码器、公开的 timm DINOv3 与 `ZhengPeng7/BiRefNet`，在本机生成 `models/trellis2/pipeline.json`。本文的验证基线使用这套公开条件模型配置；它与上游 `pipeline.json` 原配的 Facebook DINOv3、RMBG-2.0 配置不同。模型版本或条件模型改变后应重新做质量对照。模型下载需遵守各模型仓库的许可和访问要求。
 
 ## 启动常驻服务与 OpenAI 风格 API
 
@@ -72,7 +72,7 @@ bash fasttrellis2/deploy/start-service.sh
 bash fasttrellis2/deploy/stop-service.sh
 ```
 
-脚本默认读取 `fasttrellis2/deploy/config.example.json`；若仓库根目录下存在本机配置 `deploy/config.json`，则优先读取该文件。复制样例并按主机调整模型目录、GPU、端口及显存预算后，可用 `FASTTRELLIS2_CONFIG=/path/to/config.json` 指定配置。Conda 环境默认名为 `fasttrellis2`；可用 `FASTTRELLIS2_CONDA_ENV` 指定环境名、`FASTTRELLIS2_CONDA_BASE` 指定 Conda 安装目录，或用 `FASTTRELLIS2_CONDA_PREFIX` 指定环境绝对路径。PID 和日志默认写入仓库的 `deploy/` 目录，可分别通过 `FASTTRELLIS2_PID_FILE` 和 `FASTTRELLIS2_LOG_FILE` 改写。脚本仅依赖 Bash、Conda 和 Linux `/proc`，不依赖 Slurm、tmux、g3005 专用路径或登录 shell 初始化文件。
+脚本默认读取 `fasttrellis2/deploy/config.example.json`；若仓库根目录下存在本机配置 `deploy/config.json`，则优先读取该文件。复制样例并按主机调整模型目录、GPU、端口及显存预算后，可用 `FASTTRELLIS2_CONFIG=/path/to/config.json` 指定配置。Conda 环境默认名为 `fasttrellis2`；可用 `FASTTRELLIS2_CONDA_ENV` 指定环境名、`FASTTRELLIS2_CONDA_BASE` 指定 Conda 安装目录，或用 `FASTTRELLIS2_CONDA_PREFIX` 指定环境绝对路径。PID 和日志默认写入仓库的 `deploy/` 目录，可分别通过 `FASTTRELLIS2_PID_FILE` 和 `FASTTRELLIS2_LOG_FILE` 改写。脚本仅依赖 Bash、Conda 和 Linux `/proc`，不依赖 Slurm、tmux 或登录 shell 初始化文件。
 
 可用以下命令建立本机配置：
 
@@ -102,4 +102,3 @@ cp fasttrellis2/deploy/config.example.json deploy/config.json
 ## 许可与来源
 
 主仓库延续上游 [MIT 许可](LICENSE)。xatlas、OpenCV Telea 的修改源码及 CuMesh cuBVH 绑定保留在 `fasttrellis2/native/`，对应的第三方归属见 [THIRD_PARTY_NOTICES.md](fasttrellis2/THIRD_PARTY_NOTICES.md)。模型权重不在仓库内，许可由各模型发布方决定。
-

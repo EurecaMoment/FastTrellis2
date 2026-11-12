@@ -39,4 +39,3 @@ fasttrellis2_activate_conda() {
         conda activate "${FASTTRELLIS2_CONDA_ENV:-fasttrellis2}"
     fi
 }
-

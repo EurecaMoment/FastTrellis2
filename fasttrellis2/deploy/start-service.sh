@@ -78,4 +78,3 @@ printf 'Conda environment: %s\nConfig: %s\nLog: %s\n' \
     "${FASTTRELLIS2_CONDA_PREFIX:-${FASTTRELLIS2_CONDA_ENV:-fasttrellis2}}" \
     "$task_config" "$task_log_file"
 echo 'The model loads in the background; poll /ready until state=ready.'
-
