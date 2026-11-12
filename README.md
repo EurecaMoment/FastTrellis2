@@ -50,7 +50,7 @@ python fasttrellis2/prepare_models.py --output-dir models/trellis2
 
 脚本下载 `microsoft/TRELLIS.2-4B` 的 512 路线权重、外部稀疏解码器、公开的 timm DINOv3 与 `ZhengPeng7/BiRefNet`，在本机生成 `models/trellis2/pipeline.json`。node1 的验证基线使用这套公开条件模型配置；它与上游 `pipeline.json` 原配的 Facebook DINOv3、RMBG-2.0 配置不同。模型版本或条件模型改变后应重新做质量对照。模型下载需遵守各模型仓库的许可和访问要求。
 
-## 启动常驻服务
+## 启动常驻服务与 OpenAI 风格 API
 
 给 `--warmup-image` 一张**不同于正式测试输入**的 1024×1024 图片。该参数可省略，但首个正式请求会承担预热开销。GPU 可以用序号或 UUID；示例中的路径请换成实际绝对路径。
 
@@ -58,20 +58,18 @@ python fasttrellis2/prepare_models.py --output-dir models/trellis2
 bash fasttrellis2/start.sh \
   --model-dir "$PWD/models/trellis2" \
   --gpu 6 --port 3956 \
+  --max-requests 64 \
   --memory-budget-gib 32 \
   --warmup-image /absolute/path/to/warmup-1024.png
 ```
 
 服务默认只绑定 `127.0.0.1`。`GET /ready` 返回 `state=ready` 后即可请求。模型权重、固定时间条件、CUDA Graph 和核缓存常驻；每个新物体的图像 K/V、稀疏元数据和材质等输入相关内容会重新计算或在同物体采样步间复用，并在请求结束清理。不会复用已生成资产。50 GB 进程显存门槛由 NVML 请求准入检查保护；`--memory-budget-gib 32` 是 PyTorch 分配预算，另有原生 CUDA arena 和预留空间。
 
-```bash
-curl -sS http://127.0.0.1:3956/ready
-curl -sS http://127.0.0.1:3956/infer \
-  -H 'Content-Type: application/json' \
-  -d '{"output_dir":"/absolute/path/to/output-001","objects":[{"object_id":"sample","image":"/absolute/path/to/object-1024.png","seed":42}],"deadline_seconds":3600}'
-```
+推理接口统一为 **OpenAI 风格 3D 扩展**，旧 `/infer` 已移除。使用 `GET /v1/models` 获取模型，向 `POST /v1/objects/generations` 提交 `model="fasttrellis2"` 与 base64/data URL 图片，获取任务 ID，再查询同一任务并通过 `/v1/files/{file_id}/content` 下载 GLB。图片必须为 1024×1024；可传同尺寸掩码，透明输入会保留 alpha，无掩码或 alpha 时使用 BiRefNet。无需向客户端暴露服务器文件路径。
 
-输入须为 1024×1024；可另传同尺寸 `mask` 路径。无掩码时会运行 BiRefNet 去背景，耗时和上述已整理输入 A/B 不可直接相比。完成后输出 `sample.glb`、`sample.complete.json` 和 `trellis_result.json`。返回中的 `image_to_glb_seconds` 包含完整资产生成；`cache_hit=false` 指资产没有复用。
+默认最多受理 **64 个未结束任务**；额外提交返回 429。请求之间采用有界流水线：下一请求的 GPU 生成可与前一请求的 CPU 校验、无损 PNG 编码和 GLB 写出重叠；默认两个 CPU 导出工作线程、最多三个请求持有阶段数据。同一物体内部仍保留 CPU UV 与 GPU 材质的重叠。GPU 阶段使用一份常驻模型，按物体隔离输入缓存。任务有持久化回执，支持异步状态、超时、协作式取消和服务重启后的完整结果查询；只有完整产物才会标记完成。
+
+设置环境变量 `FASTTRELLIS2_API_KEY` 可启用 Bearer 鉴权；非回环监听必须设置。OpenAI 没有官方图生 3D 接口，本服务不实现 Chat Completions、Responses 或 Images。完整字段、状态、SDK 示例与并发语义见 [API 文档](fasttrellis2/OPENAI_API.md)。
 
 如需按配置文件启动，可使用 `bash fasttrellis2/start.sh --config /path/to/config.json`。可配置路径、GPU、端口、内存预算及预热图片；UV 分组上限固定为 4096，稀疏结构并行 CFG、零负条件缓存和融合算子保持启用。相对路径以配置文件目录为基准。运行环境需要通过 `fasttrellis2/start.sh` 提供扩展目录与 `LD_PRELOAD`。
 
