@@ -1,17 +1,19 @@
 """Resident TRELLIS.2 mesh/PBR service with bounded requests and real deadlines."""
 import argparse
+from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
 import json
 import os
 from pathlib import Path
 import queue
 import re
 import socket
+import signal
 import subprocess
 import threading
 import time
 import traceback
 import uuid
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
 PIPELINE_TYPE = '512'
@@ -32,6 +34,10 @@ class RequestExpired(RuntimeError):
     pass
 
 
+class RequestCancelled(RequestExpired):
+    pass
+
+
 def write_json(path, value):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -42,7 +48,7 @@ def write_json(path, value):
 
 class Item:
     def __init__(self, request, timeout):
-        self.id = uuid.uuid4().hex
+        self.id = request.get('generation_id') or uuid.uuid4().hex
         self.request = request
         self.arrived = time.perf_counter()
         self.deadline = self.arrived + timeout
@@ -50,9 +56,15 @@ class Item:
         self.done = threading.Event()
         self.result = None
         self.error = None
+        self.error_code = None
+        self.started_at = None
+        self.stage = 'queued'
+        self.pipeline_timing = {}
 
     def check(self, *_args):
-        if self.canceled.is_set() or time.perf_counter() >= self.deadline:
+        if self.canceled.is_set():
+            raise RequestCancelled('Generation cancelled before a complete mesh/PBR artifact was produced')
+        if time.perf_counter() >= self.deadline:
             raise RequestExpired('Request deadline exceeded before a complete mesh/PBR artifact was produced')
 
 
@@ -119,6 +131,9 @@ class TrellisModel:
         self.startup_warmup = None
         from trellis_native512_runtime import Native512Runtime
         self.native_runtime = Native512Runtime(self)
+        # This function only reads the detached CPU mesh and material pixels.
+        # Export threads must never touch the shared native runtime or CUDA.
+        self.export_glb = self.native_runtime.export_glb
         if config.get('startup_warmup_image'):
             warmup_image = Path(config['startup_warmup_image'])
             warmup = Item({'profile': 'native512',
@@ -132,10 +147,13 @@ class TrellisModel:
             self.current.check()
 
     def infer(self, item):
-        with self.torch.inference_mode():
-            return self._infer(item)
+        return self.finish(item, self.prepare(item))
 
-    def _infer(self, item):
+    def prepare(self, item):
+        with self.torch.inference_mode():
+            return self._prepare(item)
+
+    def _prepare(self, item):
         from PIL import Image
         self.memory_monitor.admit(self.torch.cuda.memory_reserved(),
             self.config['memory_budget_gib']*1024**3)
@@ -145,7 +163,7 @@ class TrellisModel:
         texture_size = 4096
         output = Path(request['output_dir'])
         output.mkdir(parents=True, exist_ok=True)
-        assets = []
+        prepared = []
         self.current = item
         self.torch.cuda.reset_peak_memory_stats()
         started = time.perf_counter()
@@ -211,20 +229,10 @@ class TrellisModel:
                     uv_group_face_cap=self.config.get('uv_group_face_cap', 4096))
                 mark_outer('postprocess_call_seconds')
                 item.check()
-                if not len(glb.faces) or not self.np.isfinite(glb.vertices).all():
-                    raise ValueError('TRELLIS produced empty or nonfinite mesh geometry')
                 material = glb.visual.material
-                if getattr(material, 'baseColorTexture', None) is None or getattr(material, 'metallicRoughnessTexture', None) is None:
-                    raise ValueError('TRELLIS mesh is missing PBR texture payloads')
                 destination = output / (row['object_id'] + '.glb')
-                temporary = output / (row['object_id'] + '.' + item.id + '.partial.glb')
-                export_timing.update(self.native_runtime.export_glb(glb, temporary, 0))
-                mark_outer('validation_encode_write_seconds')
-                item.check()
-                temporary.replace(destination)
                 self.torch.cuda.synchronize()
-                mark_outer('rename_and_final_sync_seconds')
-                image_to_glb_seconds = time.perf_counter() - object_started
+                mark_outer('gpu_final_sync_seconds')
                 asset = {'object_id': row['object_id'], 'asset': destination.name,
                     'model': 'microsoft/TRELLIS.2-4B', 'source_frame': 'y_up',
                     'representation': 'mesh_pbr', 'metric_reconstruction': False,
@@ -234,41 +242,74 @@ class TrellisModel:
                     'vertices': len(glb.vertices), 'triangles': len(glb.faces),
                     'base_color_texture_size': list(material.baseColorTexture.size),
                     'metallic_roughness_texture_size': list(material.metallicRoughnessTexture.size),
-                    'bytes': destination.stat().st_size, 'inputs': inputs,
+                    'inputs': inputs,
                     'generation_seconds': generation_seconds,
-                    'export_seconds': time.perf_counter() - export_start,
                     'export_profile': native_export_profile(self.config),
                     'profile': profile, 'remesh': remesh, 'generation_timing': generation_timing,
                     'export_timing': export_timing,
-                    'image_to_glb_seconds': image_to_glb_seconds, 'outer_timing': outer_timing,
+                    'outer_timing': outer_timing,
                     'diagnostic_capture': request.get('capture_optimization_inputs') is True,
                     'uv_mode': 'xatlas', 'texture_sampling': 'sparse'}
-                asset.update(self.native_runtime.details())
-                write_json(destination.with_suffix('.complete.json'), {'asset': asset,
-                    'provider': 'trellis2', 'request_id': item.id, 'status': 'complete'})
-                assets.append(asset)
+                asset.update(deepcopy(self.native_runtime.details()))
+                # to_glb has joined every GPU copy. The CPU mesh retains the
+                # per-request NumPy arrays (including raw material pixels),
+                # independent of the next request's scratch arena and caches.
                 self.native_runtime.end()
-                del mesh, glb
+                prepared.append((glb, destination, asset, object_started, export_start))
+                del mesh
             self.torch.cuda.synchronize()
             item.check()
             result = {'status': 'ok', 'provider': 'trellis2', 'model': 'microsoft/TRELLIS.2-4B',
-                'assets': assets, 'cache_hit': False, 'asset_cache_hit': False,
+                'assets': [], 'cache_hit': False, 'asset_cache_hit': False,
                 'cache_hit_scope': 'generated assets only; inference caches are reported per object',
                 'representations': ['mesh_pbr'],
                 'timing': {'queue_seconds': started-item.arrived,
-                    'compute_and_export_seconds': time.perf_counter()-started,
-                    'total_seconds': time.perf_counter()-item.arrived},
+                    'gpu_stage_seconds': time.perf_counter()-started},
                 'peak_allocated_gib': self.torch.cuda.max_memory_allocated()/1024**3,
                 'peak_reserved_gib': self.torch.cuda.max_memory_reserved()/1024**3,
                 'memory_budget_gib': self.config['memory_budget_gib'],
                 'process_memory_limit_bytes':50_000_000_000,'gpu_headroom_gib':2}
-            write_json(output / 'trellis_result.json', result)
-            return result
+            return prepared, result, started
         finally:
             try:
                 self.native_runtime.end()
             finally:
                 self.current = None
+
+    def finish(self, item, prepared):
+        """Validate, encode and write only CPU-owned per-request data."""
+        objects, result, started = prepared
+        output = Path(item.request['output_dir'])
+        export_started = time.perf_counter()
+        for glb, destination, asset, object_started, postprocess_started in objects:
+            item.check()
+            if not len(glb.faces) or not self.np.isfinite(glb.vertices).all():
+                raise ValueError('TRELLIS produced empty or nonfinite mesh geometry')
+            material = glb.visual.material
+            if (getattr(material, 'baseColorTexture', None) is None or
+                    getattr(material, 'metallicRoughnessTexture', None) is None):
+                raise ValueError('TRELLIS mesh is missing PBR texture payloads')
+            temporary = destination.with_name(destination.stem + '.' + item.id + '.partial.glb')
+            encode_started = time.perf_counter()
+            try:
+                asset['export_timing'].update(self.export_glb(glb, temporary, 0))
+                item.check()
+                temporary.replace(destination)
+                asset.update(bytes=destination.stat().st_size,
+                    export_seconds=time.perf_counter()-postprocess_started,
+                    image_to_glb_seconds=time.perf_counter()-object_started)
+                asset['outer_timing']['validation_encode_write_seconds'] = time.perf_counter()-encode_started
+                write_json(destination.with_suffix('.complete.json'), {'asset': asset,
+                    'provider': 'trellis2', 'request_id': item.id, 'status': 'complete'})
+                result['assets'].append(asset)
+            finally:
+                temporary.unlink(missing_ok=True)
+        item.check()
+        result['timing'].update(cpu_export_seconds=time.perf_counter()-export_started,
+            compute_and_export_seconds=time.perf_counter()-started,
+            total_seconds=time.perf_counter()-item.arrived)
+        write_json(output / 'trellis_result.json', result)
+        return result
 
 
 class Resident:
@@ -277,10 +318,25 @@ class Resident:
         self.queue = queue.Queue(maxsize=config.get('max_requests', 64))
         self.slots = threading.BoundedSemaphore(config.get('max_requests', 64))
         self.state, self.error = 'loading', None
-        self.completed = self.failed = self.expired = self.active = 0
+        self.completed = self.failed = self.expired = self.cancelled = self.active = 0
+        self.gpu_active = self.export_active = 0
+        self.lock = threading.RLock()
+        self.pending = {}
+        self.stopping = threading.Event()
+        self.export_workers = config.get('export_workers', 2)
+        self.pipeline_depth = config.get('pipeline_depth', self.export_workers + 1)
+        if (type(self.export_workers) is not int or not 1 <= self.export_workers <= 4 or
+                type(self.pipeline_depth) is not int or not 1 <= self.pipeline_depth <= self.export_workers + 1):
+            raise ValueError('export_workers must be 1..4; pipeline_depth must be 1..export_workers+1')
+        # Reserve before GPU preparation, so even a stalled filesystem cannot
+        # accumulate 64 detached 4K material payloads in host memory.
+        self.stage_slots = threading.BoundedSemaphore(self.pipeline_depth)
+        self.exporter = ThreadPoolExecutor(max_workers=self.export_workers,
+                                         thread_name_prefix='trellis-cpu-export')
         self.history = []
         self.factory = model_factory
-        threading.Thread(target=self.run, daemon=True).start()
+        self.worker = threading.Thread(target=self.run, daemon=True, name='trellis-gpu')
+        self.worker.start()
 
     def status(self):
         _, pipeline_type = resolve_profile({})
@@ -294,9 +350,14 @@ class Resident:
         return {'model': 'trellis2', 'model_id': 'microsoft/TRELLIS.2-4B',
             'state': self.state, 'error': self.error, 'host': socket.gethostname(),
             'gpu': os.environ.get('CUDA_VISIBLE_DEVICES'), 'queue': self.queue.qsize(),
-            'active_batch': self.active, 'max_requests': self.config.get('max_requests', 64),
+            'active_batch': self.gpu_active, 'active_requests': self.active,
+            'gpu_active': self.gpu_active, 'cpu_exports_active': self.export_active,
+            'pipeline_depth': self.pipeline_depth, 'export_workers': self.export_workers,
+            'execution': 'gpu-with-bounded-cpu-export-pipeline',
+            'max_requests': self.config.get('max_requests', 64),
             'max_batch': 1, 'completed': self.completed, 'failed': self.failed,
             'expired': self.expired, 'latency_recent': self.history[-64:],
+            'cancelled': self.cancelled,
             'representations': ['mesh_pbr'], 'gaussian_supported': False,
             'pipeline': pipeline_type, 'texture_size': 4096, 'resident': True,
             'sampling_steps': 12, 'uv_mode': 'xatlas',
@@ -314,10 +375,12 @@ class Resident:
             'process_memory_limit_bytes':50_000_000_000,'gpu_headroom_gib':2}
 
     def submit(self, request, timeout):
+        if self.stopping.is_set() or self.state != 'ready':
+            raise RuntimeError('Resident model is not ready')
         resolve_profile(request)
         rows = request.get('objects')
-        if not isinstance(rows, list) or not rows or not Path(request.get('output_dir', '')).is_absolute():
-            raise ValueError('objects and an absolute output_dir are required')
+        if not isinstance(rows, list) or len(rows) != 1 or not Path(request.get('output_dir', '')).is_absolute():
+            raise ValueError('Exactly one object and an absolute output_dir are required')
         seen = set()
         for row in rows:
             identity = row.get('object_id')
@@ -330,11 +393,68 @@ class Resident:
             raise queue.Full()
         item = Item(request, timeout)
         try:
-            self.queue.put_nowait(item)
+            with self.lock:
+                if self.stopping.is_set():
+                    raise RuntimeError('Resident model is stopping')
+                self.pending[item.id] = item
+                self.queue.put_nowait(item)
         except BaseException:
+            with self.lock:
+                self.pending.pop(item.id, None)
             self.slots.release()
             raise
         return item
+
+    def _complete(self, item, *, result=None, error=None, admitted=False):
+        with self.lock:
+            if error is None:
+                item.result = result
+                item.stage = 'completed'
+                self.completed += 1
+                self.history.append(time.perf_counter()-item.arrived)
+                self.history = self.history[-64:]
+            else:
+                item.error = str(error)
+                if isinstance(error, RequestCancelled):
+                    item.error_code, item.stage = 'request_cancelled', 'cancelled'
+                    self.cancelled += 1
+                elif isinstance(error, RequestExpired):
+                    item.error_code, item.stage = 'inference_timeout', 'failed'
+                    self.expired += 1
+                else:
+                    item.error_code, item.stage = 'inference_failed', 'failed'
+                    self.failed += 1
+                    print(f'Generation {item.id} failed: {error}', flush=True)
+            if admitted:
+                self.active -= 1
+                self.stage_slots.release()
+            self.pending.pop(item.id, None)
+            self.slots.release()
+            self.queue.task_done()
+            item.done.set()
+
+    def _export(self, item, prepared):
+        with self.lock:
+            self.export_active += 1
+            item.stage = 'cpu_export'
+            item.pipeline_timing['cpu_export_started_at'] = time.time()
+        result = error = None
+        try:
+            item.check()
+            result = self.model.finish(item, prepared)
+            item.check()
+            item.pipeline_timing['cpu_export_finished_at'] = time.time()
+            result['pipeline'] = dict(item.pipeline_timing)
+            # Persist stage times before publishing the successful receipt.
+            write_json(Path(item.request['output_dir']) / 'trellis_result.json', result)
+        except Exception as exc:
+            error = exc
+            if not isinstance(exc, RequestExpired):
+                print(traceback.format_exc(), flush=True)
+        finally:
+            with self.lock:
+                self.export_active -= 1
+            self._complete(item, result=result, error=error, admitted=True)
 
     def run(self):
         try:
@@ -345,92 +465,52 @@ class Resident:
             self.state, self.error = 'failed', traceback.format_exc()
             print(self.error, flush=True)
             return
-        while True:
-            item = self.queue.get()
-            self.active = 1
+        while not self.stopping.is_set() or not self.queue.empty():
+            try:
+                item = self.queue.get(timeout=.1)
+            except queue.Empty:
+                continue
+            admitted = False
             try:
                 item.check()
-                item.result = self.model.infer(item)
-                self.completed += 1
-                self.history.append(time.perf_counter()-item.arrived)
-            except RequestExpired as error:
-                item.error = str(error)
-                self.expired += 1
+                while not self.stage_slots.acquire(timeout=.05):
+                    item.check()
+                admitted = True
+                with self.lock:
+                    self.active += 1
+                    self.gpu_active = 1
+                item.check()
+                item.started_at = time.time()
+                item.stage = 'gpu'
+                item.pipeline_timing['gpu_started_at'] = time.time()
+                prepared = self.model.prepare(item)
+                item.pipeline_timing['gpu_finished_at'] = time.time()
+                item.check()
+                item.stage = 'waiting_for_cpu_export'
+                self.exporter.submit(self._export, item, prepared)
             except Exception as error:
-                item.error = str(error)
-                self.failed += 1
-                print(traceback.format_exc(), flush=True)
+                if not isinstance(error, RequestExpired):
+                    print(traceback.format_exc(), flush=True)
+                self._complete(item, error=error, admitted=admitted)
             finally:
-                item.done.set()
-                self.slots.release()
-                self.active = 0
-                self.queue.task_done()
+                self.gpu_active = 0
+                # Do not retain the previous mesh while waiting for new work.
+                prepared = None
+
+    def close(self, timeout=30):
+        self.stopping.set()
+        self.state = 'stopping'
+        with self.lock:
+            for item in self.pending.values():
+                item.canceled.set()
+        self.worker.join(timeout=timeout)
+        self.exporter.shutdown(wait=not self.worker.is_alive())
 
 
-class Server(ThreadingHTTPServer):
-    request_queue_size = 256
-    daemon_threads = True
-
-
-def make_server(address, resident):
-    class Handler(BaseHTTPRequestHandler):
-        def log_message(self, *_args):
-            pass
-
-        def reply(self, status, value):
-            data = json.dumps(value).encode()
-            self.send_response(status)
-            self.send_header('Content-Type', 'application/json')
-            self.send_header('Content-Length', str(len(data)))
-            self.end_headers()
-            try:
-                self.wfile.write(data)
-            except (BrokenPipeError, ConnectionResetError):
-                pass
-
-        def do_GET(self):
-            if self.path in ('/health', '/ready', '/metrics'):
-                self.reply(503 if self.path == '/ready' and resident.state != 'ready' else 200, resident.status())
-            else:
-                self.reply(404, {'error': 'Unknown endpoint'})
-
-        def do_POST(self):
-            if self.path != '/infer':
-                self.reply(404, {'error': 'Unknown endpoint'})
-                return
-            if resident.state != 'ready':
-                self.reply(503, resident.status())
-                return
-            try:
-                size = int(self.headers.get('Content-Length', '0'))
-                if not 0 < size <= 4*1024**2:
-                    raise ValueError('Request JSON size must be between 1 byte and 4 MiB')
-                request = json.loads(self.rfile.read(size))
-                try:
-                    from fit_paths import FitPaths
-                except ModuleNotFoundError:
-                    transport = None
-                else:
-                    transport = FitPaths(request)
-                timeout = float(request.get('deadline_seconds', 3600))
-                if not .01 <= timeout <= 3600:
-                    raise ValueError('deadline_seconds must be between 0.01 and 3600')
-                item = resident.submit(request, timeout)
-                if not item.done.wait(max(0, item.deadline-time.perf_counter())):
-                    item.canceled.set()
-                    self.reply(504, {'status': 'deadline_exceeded', 'request_id': item.id,
-                        'completed_artifact': False, 'provider': 'trellis2'})
-                elif item.error:
-                    self.reply(504 if 'deadline' in item.error.lower() else 500,
-                        {'status': 'failed', 'error': item.error, 'provider': 'trellis2'})
-                else:
-                    self.reply(200, transport.finish(item.result) if transport else item.result)
-            except queue.Full:
-                self.reply(429, {'error': '64-request capacity reached; no extra GPU work was dispatched'})
-            except (ValueError, KeyError, TypeError) as error:
-                self.reply(400, {'error': str(error)})
-
-    return Server(address, Handler)
+if __package__:
+    from .openai_api import make_server
+else:
+    from openai_api import make_server
 
 
 def main():
@@ -439,6 +519,11 @@ def main():
     parser.add_argument('--model-dir', help='Local TRELLIS.2 model folder with pipeline.json')
     parser.add_argument('--gpu', help='GPU index or UUID; sets CUDA_VISIBLE_DEVICES')
     parser.add_argument('--port', type=int)
+    parser.add_argument('--max-requests', type=int, help='Maximum admitted generations, up to 64 (default: 64)')
+    parser.add_argument('--export-workers', type=int, help='CPU export threads, 1..4 (default: 2)')
+    parser.add_argument('--pipeline-depth', type=int, help='GPU/CPU payload limit, 1..export-workers+1 (default: 3)')
+    parser.add_argument('--api-key-env', help='Environment variable containing the API Bearer token')
+    parser.add_argument('--api-output-dir', help='Server-managed input, receipt and GLB directory')
     parser.add_argument('--warmup-image', help='Optional 1024x1024 startup image')
     parser.add_argument('--memory-budget-gib', type=float)
     args = parser.parse_args()
@@ -450,7 +535,8 @@ def main():
         native512_release_profile='fasttrellis2-v1',
         uv_group_face_cap=4096, native512_parallel_dense_cfg=True,
         native512_zero_negative_cross_attention=True, fused_pointwise=True,
-        parallel_inpaint=True, max_requests=32)
+        parallel_inpaint=True, max_requests=64, export_workers=2,
+        api_key_env='FASTTRELLIS2_API_KEY')
     config_base = repo
     if args.config:
         config_file = Path(args.config).expanduser().resolve()
@@ -458,7 +544,9 @@ def main():
         config_base = config_file.parent
     overrides = dict(model_dir=args.model_dir, gpu=args.gpu, port=args.port,
         startup_warmup_image=args.warmup_image,
-        memory_budget_gib=args.memory_budget_gib)
+        memory_budget_gib=args.memory_budget_gib, max_requests=args.max_requests,
+        export_workers=args.export_workers, pipeline_depth=args.pipeline_depth,
+        api_key_env=args.api_key_env, api_output_dir=args.api_output_dir)
     for key, value in overrides.items():
         if value is not None:
             config[key] = value
@@ -474,16 +562,42 @@ def main():
         parser.error('Only the native512 profile is supported')
     if config.get('native512_resident_runtime', True) is not True:
         parser.error('The measured fast 512 profile requires the resident runtime')
-    for key in ('root', 'source_dir', 'model_dir', 'cache_home', 'startup_warmup_image'):
+    if type(config.get('max_requests')) is not int or not 1 <= config['max_requests'] <= 64:
+        parser.error('max_requests must be an integer between 1 and 64')
+    workers = config['export_workers']
+    depth = config.setdefault('pipeline_depth', workers + 1 if type(workers) is int else 3)
+    if type(workers) is not int or not 1 <= workers <= 4:
+        parser.error('export_workers must be an integer between 1 and 4')
+    if type(depth) is not int or not 1 <= depth <= workers + 1:
+        parser.error('pipeline_depth must be an integer between 1 and export_workers+1')
+    for key in ('root', 'source_dir', 'model_dir', 'cache_home', 'startup_warmup_image', 'api_output_dir'):
         if config.get(key):
             value = Path(config[key]).expanduser()
-            base = Path.cwd() if key in ('model_dir', 'startup_warmup_image') and overrides.get(key) else config_base
+            base = Path.cwd() if key in ('model_dir', 'startup_warmup_image', 'api_output_dir') and overrides.get(key) else config_base
             config[key] = str(value if value.is_absolute() else (base / value).resolve())
     if not (Path(config['model_dir']) / 'pipeline.json').is_file():
         parser.error(f"Missing pipeline.json in model directory: {config['model_dir']}")
     os.environ['CUDA_VISIBLE_DEVICES'] = str(config['gpu'])
+    api_key = os.environ.get(config['api_key_env']) or None
+    # Check listener credentials before allocating the resident GPU model.
+    import ipaddress
+    host = config.get('host', '127.0.0.1')
+    try:
+        loopback = ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        loopback = host.lower() == 'localhost'
+    if not loopback and not api_key:
+        parser.error('A non-loopback API listener requires the configured API key environment variable')
     resident = Resident(config)
-    make_server((config.get('host', '127.0.0.1'), config.get('port', 3956)), resident).serve_forever()
+    server = make_server((host, config.get('port', 3956)), resident, api_key=api_key,
+                         output_root=config.get('api_output_dir'))
+    for signum in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(signum, lambda *_: threading.Thread(target=server.shutdown, daemon=True).start())
+    try:
+        server.serve_forever()
+    finally:
+        resident.close()
+        server.server_close()
 
 
 if __name__ == '__main__':
