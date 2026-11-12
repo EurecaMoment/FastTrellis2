@@ -18,13 +18,12 @@ FastTrellis2 基于 [Microsoft TRELLIS.2](https://github.com/microsoft/TRELLIS.2
 
 已验证的组合是 Linux x86_64、Python 3.10、PyTorch 2.6.0 + CUDA 12.4、A800 80GB，以及支持 AVX-512F/DQ/VL 的主机 CPU。xatlas 优化源码使用 AVX-512 指令；其他 CPU 需要另做移植与验证。运行时需 CUDA Toolkit、C++ 编译器、`libjpeg-dev` 和 `libdeflate`。A100 80GB 是合适的目标硬件，但上面的延迟数据来自 A800，不能当作 A100 实测。
 
-在仓库根目录执行：
+在仓库根目录创建独立 Conda 环境并编译运行时：
 
 ```bash
-export CUDA_HOME=/usr/local/cuda-12.4
-export TORCH_CUDA_ARCH_LIST=8.0
-python3.10 -m venv .venv
-source .venv/bin/activate
+conda create -n fasttrellis2 python=3.10 -y
+conda activate fasttrellis2
+export CUDA_HOME=/path/to/cuda-12.4
 python -m pip install --upgrade pip setuptools wheel
 python -m pip install torch==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cu124
 sudo apt-get install -y libjpeg-dev libdeflate0
@@ -39,6 +38,8 @@ git -C third_party/CuMesh submodule update --init --recursive
 python -m pip install ./third_party/CuMesh --no-build-isolation
 python fasttrellis2/build_extensions.py --cumesh-source third_party/CuMesh
 ```
+
+将 `CUDA_HOME` 指向目标主机安装的 CUDA Toolkit。构建时通常可让 PyTorch 根据可见 GPU 选择 CUDA 架构；如果在没有 GPU 的构建机上编译，再设置 `TORCH_CUDA_ARCH_LIST` 为目标 GPU 架构。运行时不会固定 CUDA 架构。编译器、CUDA Toolkit 和驱动版本需与目标硬件及 PyTorch CUDA 版本兼容。
 
 `setup.sh` 是上游安装脚本，负责基础库、nvdiffrast 与仓库自带的 O-Voxel。启动时必须能从当前 Python 环境导入已编译的 `o_voxel._C`。`fasttrellis2/build_extensions.py` 从本仓库的 C++/CUDA 源码构建一个有界分组 xatlas 模块、两个 Telea 模块、异步 BVH 和有界 CUDA scratch arena。产物位于 `fasttrellis2/build/`，不会提交到 Git。
 
@@ -63,6 +64,25 @@ bash fasttrellis2/start.sh \
   --warmup-image /absolute/path/to/warmup-1024.png
 ```
 
+在已有 Linux GPU 主机上通过独立 Conda 环境以后台服务启动，可使用随仓库提供的 Bash 脚本：
+
+```bash
+bash fasttrellis2/deploy/start-service.sh
+
+bash fasttrellis2/deploy/stop-service.sh
+```
+
+脚本默认读取 `fasttrellis2/deploy/config.example.json`；若仓库根目录下存在本机配置 `deploy/config.json`，则优先读取该文件。复制样例并按主机调整模型目录、GPU、端口及显存预算后，可用 `FASTTRELLIS2_CONFIG=/path/to/config.json` 指定配置。Conda 环境默认名为 `fasttrellis2`；可用 `FASTTRELLIS2_CONDA_ENV` 指定环境名、`FASTTRELLIS2_CONDA_BASE` 指定 Conda 安装目录，或用 `FASTTRELLIS2_CONDA_PREFIX` 指定环境绝对路径。PID 和日志默认写入仓库的 `deploy/` 目录，可分别通过 `FASTTRELLIS2_PID_FILE` 和 `FASTTRELLIS2_LOG_FILE` 改写。脚本仅依赖 Bash、Conda 和 Linux `/proc`，不依赖 Slurm、tmux、g3005 专用路径或登录 shell 初始化文件。
+
+可用以下命令建立本机配置：
+
+```bash
+mkdir -p deploy
+cp fasttrellis2/deploy/config.example.json deploy/config.json
+```
+
+启动脚本只负责环境激活与进程管理；运行服务仍要求按上文安装依赖、编译扩展、准备模型权重，并满足目标 GPU/CPU 的硬件要求。此发布脚本不表示所有 Linux GPU 或 CPU 均已通过模型端到端验证。
+
 服务默认只绑定 `127.0.0.1`。`GET /ready` 返回 `state=ready` 后即可请求。模型权重、固定时间条件、CUDA Graph 和核缓存常驻；每个新物体的图像 K/V、稀疏元数据和材质等输入相关内容会重新计算或在同物体采样步间复用，并在请求结束清理。不会复用已生成资产。50 GB 进程显存门槛由 NVML 请求准入检查保护；`--memory-budget-gib 32` 是 PyTorch 分配预算，另有原生 CUDA arena 和预留空间。
 
 推理接口统一为 **OpenAI 风格 3D 扩展**，旧 `/infer` 已移除。使用 `GET /v1/models` 获取模型，向 `POST /v1/objects/generations` 提交 `model="fasttrellis2"` 与 base64/data URL 图片，获取任务 ID，再查询同一任务并通过 `/v1/files/{file_id}/content` 下载 GLB。图片必须为 1024×1024；可传同尺寸掩码，透明输入会保留 alpha，无掩码或 alpha 时使用 BiRefNet。无需向客户端暴露服务器文件路径。
@@ -82,3 +102,4 @@ bash fasttrellis2/start.sh \
 ## 许可与来源
 
 主仓库延续上游 [MIT 许可](LICENSE)。xatlas、OpenCV Telea 的修改源码及 CuMesh cuBVH 绑定保留在 `fasttrellis2/native/`，对应的第三方归属见 [THIRD_PARTY_NOTICES.md](fasttrellis2/THIRD_PARTY_NOTICES.md)。模型权重不在仓库内，许可由各模型发布方决定。
+
